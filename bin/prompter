@@ -1,0 +1,251 @@
+#!/usr/bin/env bash
+# Prompter — voice remote control for the OpenCode TUI (or any terminal app in tmux).
+#
+# Usage: prompter [command]
+#   start (default)   boot everything: tmux session, bridge, QR codes
+#   stop              stop the bridge (tmux session keeps running)
+#   restart           restart the bridge
+#   status            bridge health + connectivity summary
+#   qr                print the phone-app QR code(s) again
+#   attach            open the TUI in a local terminal window
+#   logs              follow bridge logs
+#   help              this help
+set -euo pipefail
+
+VERSION="1.0.0"
+SELF_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+BRIDGE="${PROMPTER_BRIDGE:-$(cd "$SELF_DIR/.." && pwd)/bridge}"
+PORT="${PROMPTER_PORT:-8788}"
+TMUX_SESSION="${PROMPTER_TMUX_SESSION:-opencode}"
+SERVICE="${PROMPTER_SERVICE:-prompter.service}"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/prompter"
+PID_FILE="$STATE_DIR/bridge.pid"
+LOG_FILE="$STATE_DIR/bridge.log"
+LOCK="${XDG_RUNTIME_DIR:-/tmp}/prompter.lock"
+
+[ -d "$BRIDGE" ] || { echo "Bridge not found at $BRIDGE (reinstall or set PROMPTER_BRIDGE)"; exit 1; }
+mkdir -p "$STATE_DIR"
+
+HAS_SYSTEMD=0
+command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1 && HAS_SYSTEMD=1
+
+lan_ip() {
+    local ip
+    ip="$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src\s+\K[\d.]+' | head -1 || true)"
+    [ -z "$ip" ] && ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    [ -z "$ip" ] && ip="127.0.0.1"
+    echo "$ip"
+}
+
+# NOTE: `tailscale ip -4` returns an address even when stopped —
+# check the actual state instead (status also exits non-zero when down).
+ts_is_up() {
+    command -v tailscale >/dev/null 2>&1 || return 1
+    local out
+    out="$(tailscale status --peers=false 2>&1)" || return 1
+    ! grep -qiE 'stopped|logged out' <<<"$out"
+}
+
+print_qr() { # $1 = link
+    if command -v qrencode >/dev/null 2>&1; then
+        qrencode -t utf8 -m 2 "$1"
+    elif [ -x "$BRIDGE/.venv/bin/qr" ]; then
+        "$BRIDGE/.venv/bin/qr" --ascii "$1"
+    else
+        echo "  (no QR renderer: install qrencode, or bridge/.venv/bin/pip install qrcode)"
+        echo "  Link: $1"
+    fi
+}
+
+token() { cat "$BRIDGE/.token" 2>/dev/null || true; }
+
+# ---------------------------------------------------------------- bridge ---
+
+bridge_start_systemd() {
+    systemctl --user daemon-reload
+    systemctl --user is-enabled --quiet "$SERVICE" 2>/dev/null || systemctl --user enable "$SERVICE" >/dev/null 2>&1
+    systemctl --user restart "$SERVICE"
+}
+
+bridge_start_nohup() {
+    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        echo "      already running (pid $(cat "$PID_FILE"))"
+        return 0
+    fi
+    ( cd "$BRIDGE" && setsid nohup .venv/bin/uvicorn main:app \
+        --host 0.0.0.0 --port "$PORT" >>"$LOG_FILE" 2>&1 & echo $! >"$PID_FILE" )
+}
+
+bridge_stop() {
+    if [ "$HAS_SYSTEMD" = 1 ] && systemctl --user is-active --quiet "$SERVICE" 2>/dev/null; then
+        systemctl --user stop "$SERVICE"
+    elif [ -f "$PID_FILE" ]; then
+        local pid
+        pid="$(cat "$PID_FILE")"
+        if kill -0 "$pid" 2>/dev/null; then kill "$pid" && echo "stopped (pid $pid)"; fi
+        rm -f "$PID_FILE"
+    else
+        echo "not running"
+    fi
+}
+
+bridge_healthy() {
+    curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1
+}
+
+wait_healthy() {
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        bridge_healthy && return 0
+        sleep 0.5
+    done
+    return 1
+}
+
+# ------------------------------------------------------------- tmux / TUI ---
+
+ensure_tmux_session() {
+    if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+        echo "      OK — session '$TMUX_SESSION' exists"
+        return 0
+    fi
+    tmux new-session -d -s "$TMUX_SESSION" -c "$HOME" -x 220 -y 65
+    tmux send-keys -t "$TMUX_SESSION" "opencode" C-m
+    sleep 2
+    if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+        echo "      started (running 'opencode' inside)"
+    else
+        echo "      FAILED to create session"
+    fi
+}
+
+attach_tui() {
+    if command -v ptyxis >/dev/null 2>&1; then
+        ptyxis -- tmux attach -t "$TMUX_SESSION" >/dev/null 2>&1 &
+    elif command -v kgx >/dev/null 2>&1; then
+        kgx -e tmux attach -t "$TMUX_SESSION" >/dev/null 2>&1 &
+    elif command -v gnome-terminal >/dev/null 2>&1; then
+        gnome-terminal -- tmux attach -t "$TMUX_SESSION" >/dev/null 2>&1 &
+    else
+        echo "      no known terminal — attach manually: tmux attach -t $TMUX_SESSION"
+        return
+    fi
+    echo "      terminal launched"
+}
+
+# ------------------------------------------------------------------ QR -----
+
+show_qr() {
+    local tok ip
+    tok="$(token)"
+    ip="$(lan_ip)"
+    [ -z "$tok" ] && { echo "No token yet ($BRIDGE/.token) — start the bridge first."; return 1; }
+
+    if [ "$ip" != "127.0.0.1" ]; then
+        echo "Wi-Fi / LAN (same network):"
+        print_qr "prompter://connect?host=$ip&port=$PORT&token=$tok"
+    fi
+
+    # Tailscale: same bridge via your private tailnet — works from anywhere,
+    # nothing is exposed to the public internet.
+    #   --accept-dns=false  don't override the system DNS (tailnet DNS may be dead)
+    #   --exit-node=        don't route traffic through another node
+    local ts_ip=""
+    if command -v tailscale >/dev/null 2>&1 && ! ts_is_up; then
+        echo ""
+        echo "Tailscale: enabling (sudo may ask for your password)..."
+        systemctl is-active --quiet tailscaled 2>/dev/null || \
+            sudo systemctl enable --now tailscaled 2>/dev/null || true
+        # --reset converges prefs to a known state regardless of manual edits
+        if sudo tailscale up --reset --accept-dns=false --exit-node= \
+                --operator="$USER" --timeout=20s 2>&1; then
+            sleep 1
+        else
+            echo "      not logged in: open the auth URL above in a browser, then re-run"
+        fi
+    fi
+    if ts_is_up; then
+        ts_ip="$(tailscale ip -4 2>/dev/null | head -1 || true)"
+    fi
+    if [ -n "$ts_ip" ]; then
+        echo ""
+        echo "Tailscale (works over the internet): $ts_ip"
+        print_qr "prompter://connect?host=$ts_ip&port=$PORT&token=$tok"
+    fi
+}
+
+# ------------------------------------------------------------- commands ----
+
+cmd_start() {
+    exec 9>"$LOCK"
+    if ! flock -n 9; then
+        echo "prompter is already starting in another window — exiting."
+        exit 0
+    fi
+
+    echo "=== Prompter v$VERSION ==="
+    echo ""
+    echo "[1/3] tmux session '$TMUX_SESSION'..."
+    ensure_tmux_session
+
+    echo "[2/3] Bridge..."
+    if [ "$HAS_SYSTEMD" = 1 ]; then
+        bridge_start_systemd
+    else
+        echo "      (no systemd user session — background mode, logs: $LOG_FILE)"
+        bridge_start_nohup
+    fi
+    if wait_healthy; then
+        echo "      healthy on port $PORT"
+    else
+        echo "      health check FAILED"
+        [ "$HAS_SYSTEMD" = 1 ] && echo "      logs: journalctl --user -u $SERVICE -e"
+        return 1
+    fi
+
+    echo "[3/3] Connect the phone app — scan a QR:"
+    show_qr || true
+
+    echo ""
+    echo "TUI is hidden (detached tmux). Open locally: prompter attach"
+}
+
+cmd_status() {
+    echo "Prompter v$VERSION"
+    if bridge_healthy; then
+        echo "bridge:   healthy (port $PORT)"
+        curl -sf "http://127.0.0.1:$PORT/health" && echo
+    else
+        echo "bridge:   DOWN"
+    fi
+    if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+        echo "tmux:     session '$TMUX_SESSION' running"
+    else
+        echo "tmux:     no session '$TMUX_SESSION'"
+    fi
+    if ts_is_up; then
+        echo "tailscale: up ($(tailscale ip -4 2>/dev/null | head -1))"
+    else
+        echo "tailscale: down (internet access unavailable; see README)"
+    fi
+}
+
+cmd_logs() {
+    if [ "$HAS_SYSTEMD" = 1 ] && systemctl --user is-active --quiet "$SERVICE" 2>/dev/null; then
+        journalctl --user -u "$SERVICE" -f
+    else
+        tail -f "$LOG_FILE"
+    fi
+}
+
+case "${1:-start}" in
+    start)   cmd_start ;;
+    stop)    bridge_stop ;;
+    restart) bridge_stop; sleep 1; cmd_start ;;
+    status)  cmd_status ;;
+    qr)      show_qr ;;
+    attach)  attach_tui ;;
+    logs)    cmd_logs ;;
+    help|-h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//' ;;
+    version|-v|--version) echo "prompter $VERSION" ;;
+    *) echo "Unknown command: $1 (see: prompter help)"; exit 1 ;;
+esac
