@@ -10,6 +10,27 @@ SERVICE="prompter.service"
 
 say() { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 
+# Safety confirmation: this script disables services reachable via the
+# current systemd user bus and deletes files. Interactive runs must confirm;
+# non-interactive runs (scripts, tests) must pass --yes explicitly.
+if [ "${1:-}" != "--yes" ]; then
+    echo "This will stop the bridge, disable $SERVICE and remove:"
+    echo "  $BIN"
+    echo "  $DEST   (includes the auth token)"
+    echo "  $UNIT_DIR/$SERVICE"
+    if [ -t 0 ]; then
+        printf "Continue? [y/N] "
+        read -r answer
+        case "$answer" in
+            y|Y|yes|YES) ;;
+            *) echo "Aborted."; exit 1 ;;
+        esac
+    else
+        echo "Refusing to run non-interactively without --yes. Aborted."
+        exit 1
+    fi
+fi
+
 say "Stopping the bridge"
 if command -v systemctl >/dev/null 2>&1 && systemctl --user is-active --quiet "$SERVICE" 2>/dev/null; then
     systemctl --user disable --now "$SERVICE" 2>/dev/null || true
