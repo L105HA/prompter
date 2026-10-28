@@ -2,6 +2,8 @@
 
 **Voice remote control for [OpenCode](https://opencode.ai)** — drive your AI coding agent from the couch, or from anywhere in the world.
 
+🌐 **Site:** [l105ha.github.io/prompter](https://l105ha.github.io/prompter/) · ✈️ **Telegram:** [@L105HA](https://t.me/L105HA)
+
 Prompter mirrors the OpenCode TUI (running inside tmux) to your phone and lets you talk to it: dictate messages, tap TUI keys, switch sessions — with a live color preview of what the agent is doing.
 
 ```
